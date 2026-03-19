@@ -163,6 +163,80 @@ Wired as a classifier option in `classify_chunks`. The orchestrator calls it whe
 
 ---
 
+## Router-First Refactor
+
+### Problem Discovered
+
+The agentic orchestrator described above was the intended architecture. In practice, the LLM ignored system prompt routing rules. Three failure modes emerged:
+
+- **Misrouted personal queries:** Questions about the operator searched domain indexes (financial, legal, discourse) instead of personal conversation indexes containing exported chat history
+- **Misrouted domain queries:** Domain questions searched personal indexes, diluting results with irrelevant personal context
+- **Query contamination:** The LLM included the operator's name in search queries against personal indexes where every chunk already belongs to the operator — biasing embedding similarity toward identity/profile chunks instead of the actual topic
+- **Classifier mismatch:** The DeBERTa authorship classifier, designed to filter forum data (job listings, promotional content), misclassified the operator's own exported conversations as "job-listing" and filtered them out
+
+### Solution
+
+Routing decisions moved from the LLM to a deterministic Python router (`router.py`). The LLM no longer decides what to search or how to formulate queries. The router handles:
+
+1. **Personal vs domain classification** — Regex-based detection on operator name, personal pronouns, and known personal topics. Hard gate, not probabilistic.
+2. **Index selection** — Keyword scoring against the canonical registry. Personal queries route exclusively to personal indexes. Domain queries route to semantically matched domain indexes.
+3. **Query cleaning** — Operator name and personal pronouns stripped from search queries before embedding. Personal indexes contain only operator data; including the name biases toward identity chunks rather than topical content.
+4. **Authorship filter exemption** — Personal indexes bypass the DeBERTa authorship classifier entirely. The classifier was trained on forum discourse patterns and cannot meaningfully classify exported conversation data.
+5. **Follow-up awareness** — Router tracks the previous query's route type. If the last query was personal and the current query uses pronouns ("he/him/his") or definite references ("the loan," "that"), it routes as `personal_followup` to the same personal indexes.
+
+### Revised Architecture
+
+```
+query
+  → Python router (regex classification, index selection, query cleaning)
+  → FAISS search (on router-selected indexes)
+  → BGE reranker
+  → Authorship filter (domain indexes only — personal indexes exempt)
+  → LLM receives pre-retrieved, reranked, filtered evidence
+  → LLM synthesizes answer
+```
+
+System prompt dropped from ~5.4K to ~1.5K tokens. Queries that previously failed (e.g., personal financial questions routing to domain indexes) now resolve correctly in 5–7 seconds.
+
+**Design principle:** Mechanical decisions (routing, filtering, query formulation) belong in deterministic code, not in LLM inference. The LLM's strength is synthesis and reasoning over evidence, not routing decisions that can be solved with regex and keyword matching.
+
+---
+
+## BERTopic Summarization Path
+
+### Problem
+
+FAISS search retrieves the top-K most similar chunks to a query. This works for specific questions ("What was the loan amount?") but fails structurally for summarization questions ("What topics are discussed across the corpus?"). A summarization question requires seeing the entire corpus, not 10–30 chunks.
+
+### Solution
+
+Offline topic extraction using BERTopic. A batch job reads all chunks from targeted indexes, clusters them by topic using precomputed e5-large-v2 embeddings, and produces a structured topic map (JSON artifact). At query time, the router detects summarization-style questions ("what topics," "what themes," "summarize conversations") and loads the precomputed topic map instead of searching FAISS. The LLM receives the full topic structure and synthesizes from that.
+
+### Implementation
+
+- BERTopic with precomputed embeddings (no redundant re-embedding)
+- `min_topic_size=50` to suppress noise clusters
+- Output: `topic_map.json` with labels, chunk counts, percentages, top keywords, and sample chunks per topic
+- Initial deployment: 79,337 chunks across personal indexes → 277 topic clusters
+- Extensible to any index — same script, different target
+
+### Two Retrieval Paths
+
+```
+Specific question → Router → FAISS search → Rerank → Filter → LLM synthesis
+Summarization question → Router → Precomputed topic map → LLM synthesis
+```
+
+---
+
+## Anti-Hallucination Placement
+
+Anti-hallucination rules (instructions prohibiting the LLM from fabricating details not present in retrieved chunks) were moved from the system prompt to a position immediately adjacent to the evidence block in the synthesis prompt. When placed in the system prompt, the rules were ~4K tokens away from the evidence they governed. When placed adjacent to the evidence, the LLM's attention mechanism keeps them in close proximity during generation.
+
+This eliminated fabrication of specific details (dollar amounts, dates, actions) not present in source chunks. The general principle: any instruction governing how evidence should be used must be placed next to the evidence, not at the top of the prompt.
+
+---
+
 ## Infrastructure Requirements
 
 | Component | Specification |
@@ -178,11 +252,11 @@ Wired as a classifier option in `classify_chunks`. The orchestrator calls it whe
 
 | Model | VRAM |
 |-------|------|
-| Qwen3-Coder-30B-A3B (Q8_0) | ~32GB |
+| Qwen3-Coder-30B-A3B (Q4_K_XL) | ~17GB |
 | e5-large-v2 (embedding) | ~1.3GB |
 | BGE-reranker-v2-m3 | ~1.3GB |
-| **Total inference** | **~35GB** |
-| Remaining for GPU FAISS search | ~13GB |
+| **Total inference** | **~20GB** |
+| Remaining for GPU FAISS search | ~28GB |
 
 ---
 

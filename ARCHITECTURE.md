@@ -142,3 +142,82 @@ Orchestrator: "I need SEC filing data"
 ```
 
 The canonical registry (447 datasets, 606M vectors) is too large to embed in the system prompt. `list_indexes` provides a filtered view.
+
+---
+
+## Router-First Evolution
+
+The agentic architecture above was designed with the LLM as the routing decision-maker. In deployment, the LLM ignored routing instructions in the system prompt — misrouting personal queries to domain indexes, contaminating search queries with operator names, and producing inconsistent index selection.
+
+The correction: a deterministic Python router (`router.py`) now handles all mechanical decisions before the LLM sees anything. The LLM's role narrowed from orchestrator-of-everything to synthesizer-of-pre-retrieved-evidence.
+
+### Router Decision Tree
+
+```
+Query arrives
+  |
+  +-> Summarization patterns detected? (e.g., "what topics", "main themes")
+  |     AND personal context?
+  |     YES → Load precomputed BERTopic topic map → route: personal_summary
+  |
+  +-> Personal patterns detected? (operator name, pronouns, personal topics)
+  |     YES → route: personal
+  |           indexes: [mirror_engine, claude_conversations]
+  |           query: strip operator name and pronouns
+  |           authorship filter: SKIP (personal indexes are exempt)
+  |
+  +-> Previous route was personal AND follow-up signals present?
+  |     (pronouns: he/him/his, definite refs: "the loan", "that")
+  |     YES → route: personal_followup (same as personal)
+  |
+  +-> Score query against domain keyword patterns
+  |     income, finance, crypto, cybersecurity, technical, operator
+  |     TOP 2 domains → combine their registry-derived index lists
+  |     Cap at 8 indexes
+  |     → route: domain (e.g., "income+crypto")
+  |
+  +-> No patterns matched
+        → route: general (broad default index set)
+```
+
+### Updated Architecture
+
+```
+query
+  → Python router
+      ├── regex: personal vs domain classification
+      ├── keyword scoring: index selection from registry
+      ├── query cleaning: strip names/pronouns for embedding
+      └── state: tracks last route type for follow-up detection
+  → FAISS search (router-selected indexes, cleaned query)
+  → BGE reranker
+  → Authorship filter (domain only — personal indexes exempt)
+  → LLM receives evidence + trimmed system prompt (~1.5K tokens)
+  → LLM synthesizes answer
+```
+
+The LLM retains access to `rerank_chunks` and `classify_chunks` for refinement if it determines the pre-retrieved evidence needs further processing.
+
+---
+
+## BERTopic Summarization Path
+
+For summarization-class questions that cannot be answered by top-K similarity search, the router loads a precomputed topic map instead of querying FAISS.
+
+**Offline pipeline:**
+```
+All chunks in target indexes
+  → Load precomputed e5-large-v2 embeddings from FAISS index
+  → BERTopic clustering (UMAP → HDBSCAN → c-TF-IDF)
+  → topic_map.json: topic labels, chunk counts, percentages, keywords, samples
+```
+
+**Query-time path:**
+```
+"What topics are discussed?" → Router detects summarization pattern
+  → Loads topic_map.json (no FAISS search)
+  → LLM interprets keyword clusters into readable topic descriptions
+  → Answer grounded in complete corpus statistics, not 10 random chunks
+```
+
+Initial deployment: 79,337 chunks → 277 topic clusters. Extensible to any index.

@@ -83,3 +83,37 @@ Falls back to CPU if shard exceeds temporary GPU memory allocation. VRAM budget:
 | 500M–1B vectors (GPU) | <10s | Orchestrator reasoning |
 
 At current scale (606M vectors, 447 datasets), the bottleneck is CPU-based FAISS search on large shards. GPU acceleration reduces this to sub-second, making orchestrator reasoning time the dominant factor.
+
+---
+
+## Optimization Path: 316s → 29s
+
+Three sequential optimizations produced an 11x cumulative latency reduction:
+
+| Optimization | Before | After | Reduction |
+|---|---|---|---|
+| System prompt trimming (8.1K → 5.4K tokens) | 316s | ~180s | ~43% |
+| Context window reduction (32K → 16K) | ~180s | ~60s | ~67% |
+| Quantization change (Q8_0 → Q4_K_XL) | ~60s | 29s | ~52% |
+| **Cumulative** | **316s** | **29s** | **91% (11x)** |
+
+**System prompt trimming:** Removed redundant tool descriptions and verbose routing instructions. The LLM performed identically with compact tool specs.
+
+**Context window reduction:** The orchestrator's actual context usage (system prompt + query + tool results + reasoning) rarely exceeded 8K tokens. The 32K allocation reserved memory for hypothetical deep conversations that never materialized. Halving the context window freed KV cache memory and reduced per-token inference overhead.
+
+**Quantization change:** Qwen3-Coder-30B-A3B moved from Q8_0 (~32GB VRAM) to Q4_K_XL (~17GB VRAM). Retrieval routing quality — the primary function — showed no degradation. The freed ~15GB VRAM provides headroom for concurrent GPU FAISS search and future model co-loading.
+
+---
+
+## Router-First Refactor: Latency Impact
+
+Moving routing decisions from LLM inference to deterministic Python code eliminated an entire class of query failures and reduced latency for previously-broken query types:
+
+| Query Type | Before Router Refactor | After Router Refactor |
+|---|---|---|
+| Personal query (e.g., financial history) | FAIL (routed to domain indexes) | 5–7s correct |
+| Context-doc query (no retrieval needed) | 3–6s | 3–6s (unchanged) |
+| Full domain retrieval | 16–35s | ~20s average |
+| Summarization (BERTopic path) | N/A (not supported) | 6–7s |
+
+System prompt reduction from ~5.4K to ~1.5K tokens contributed additional per-query savings by reducing prompt processing overhead on every request.
